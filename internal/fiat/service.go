@@ -94,7 +94,9 @@ func (s *service) InitiateDeposit(ctx context.Context, req DepositRequest) (*Dep
 
 	resp, err := s.rail.Deposit(ctx, req)
 	if err != nil {
-		_ = s.repo.UpdateDepositStatus(ctx, deposit.ID, domain.FiatStatusFailed)
+		if updateErr := s.repo.UpdateDepositStatus(ctx, deposit.ID, domain.FiatStatusFailed); updateErr != nil {
+			return nil, fmt.Errorf("rail deposit error: %w; update deposit status: %v", err, updateErr)
+		}
 		return nil, fmt.Errorf("rail deposit error: %w", err)
 	}
 
@@ -135,13 +137,17 @@ func (s *service) InitiateWithdrawal(ctx context.Context, req WithdrawRequest) (
 	// Debit user wallet, credit platform wallet
 	_, err = s.transferSvc.InitiateTransfer(ctx, req.WalletID, s.platformWalletID, "USDC", usdcAmount)
 	if err != nil {
-		_ = s.repo.UpdateWithdrawalStatus(ctx, withdrawal.ID, domain.FiatStatusFailed)
+		if updateErr := s.repo.UpdateWithdrawalStatus(ctx, withdrawal.ID, domain.FiatStatusFailed); updateErr != nil {
+			return nil, fmt.Errorf("initiate transfer to platform: %w; update withdrawal status: %v", err, updateErr)
+		}
 		return nil, fmt.Errorf("initiate transfer to platform: %w", err)
 	}
 
 	resp, err := s.rail.Withdraw(ctx, req)
 	if err != nil {
-		_ = s.repo.UpdateWithdrawalStatus(ctx, withdrawal.ID, domain.FiatStatusFailed)
+		if updateErr := s.repo.UpdateWithdrawalStatus(ctx, withdrawal.ID, domain.FiatStatusFailed); updateErr != nil {
+			return nil, fmt.Errorf("rail withdraw error: %w; update withdrawal status: %v", err, updateErr)
+		}
 		return nil, fmt.Errorf("rail withdraw error: %w", err)
 	}
 
@@ -232,16 +238,18 @@ func (s *service) HandleWebhook(ctx context.Context, payload []byte, signature s
 				return fmt.Errorf("update withdrawal status: %w", err)
 			}
 		} else if evt.Status == "failed" {
+			// Refund the user BEFORE marking the withdrawal as failed. If the
+			// refund fails, the withdrawal stays pending so the next webhook
+			// delivery can retry — otherwise the user's USDC would be lost.
+			_, refundErr := s.transferSvc.InitiateTransfer(ctx, s.platformWalletID, withdrawal.WalletID, "USDC", withdrawal.USDCAmount)
+			if refundErr != nil {
+				return fmt.Errorf("refund user wallet for failed withdrawal: %w", refundErr)
+			}
 			if err := s.repo.UpdateWithdrawalStatus(ctx, withdrawal.ID, domain.FiatStatusFailed); err != nil {
 				if err.Error() == fmt.Sprintf("withdrawal %s already processed or not pending", withdrawal.ID) {
 					return nil
 				}
 				return fmt.Errorf("update withdrawal status: %w", err)
-			}
-			// Refund the user for failed withdrawal
-			_, refundErr := s.transferSvc.InitiateTransfer(ctx, s.platformWalletID, withdrawal.WalletID, "USDC", withdrawal.USDCAmount)
-			if refundErr != nil {
-				return fmt.Errorf("refund user wallet for failed withdrawal: %w", refundErr)
 			}
 		}
 	}

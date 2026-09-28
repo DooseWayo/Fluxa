@@ -456,6 +456,21 @@ func seedPendingDeposit(repo *mockRepository, ref string, amount decimal.Decimal
 	return d
 }
 
+func seedPendingWithdrawal(repo *mockRepository, ref string, usdcAmount decimal.Decimal) *domain.FiatWithdrawal {
+	w := &domain.FiatWithdrawal{
+		ID:                "withdrawal-" + ref,
+		WalletID:          "wallet-123",
+		Provider:          "flutterwave",
+		ProviderReference: ref,
+		FiatAmount:        decimal.NewFromInt(16000),
+		FiatCurrency:      "NGN",
+		USDCAmount:        usdcAmount,
+		Status:            domain.FiatStatusPending,
+	}
+	repo.withdrawals[w.ID] = w
+	return w
+}
+
 func TestHandleWebhook_Deposit_Success(t *testing.T) {
 	repo := newMockRepository()
 	seedPendingDeposit(repo, "REF-1", decimal.NewFromInt(16000), "NGN")
@@ -656,6 +671,119 @@ func TestHandleWebhook_Deposit_ConcurrentDelivery_OnlyCreditsOnce(t *testing.T) 
 	}
 	if repo.deposits["deposit-REF-1"].Status != domain.FiatStatusCompleted {
 		t.Errorf("expected deposit status completed, got %s", repo.deposits["deposit-REF-1"].Status)
+	}
+}
+
+// TestHandleWebhook_WithdrawalFailed_RefundBeforeStatusUpdate verifies that
+// the refund is attempted BEFORE the withdrawal is marked as failed. If the
+// refund fails, the withdrawal must remain pending so the next webhook
+// delivery can retry — otherwise the user's USDC would be permanently lost.
+func TestHandleWebhook_WithdrawalFailed_RefundBeforeStatusUpdate(t *testing.T) {
+	repo := newMockRepository()
+	seedPendingWithdrawal(repo, "REF-W1", decimal.NewFromInt(10))
+	transferSvc := &mockTransferService{
+		transferErr: errors.New("stellar network unavailable"),
+	}
+	rail := &mockRail{webhookEvt: &RailEvent{
+		Type:        EventWithdrawalFailed,
+		ProviderRef: "REF-W1",
+		Status:      "failed",
+	}}
+
+	svc := NewService(repo, rail, &mockFXService{}, transferSvc, "platform-wallet-123", "flutterwave")
+
+	err := svc.HandleWebhook(context.Background(), []byte("{}"), "sig")
+	if err == nil {
+		t.Fatal("expected error when refund fails, got nil")
+	}
+
+	// Withdrawal must remain pending so the next delivery can retry the refund
+	w := repo.withdrawals["withdrawal-REF-W1"]
+	if w == nil {
+		t.Fatal("withdrawal not found in repo")
+	}
+	if w.Status != domain.FiatStatusPending {
+		t.Errorf("expected withdrawal to stay pending after failed refund, got %s", w.Status)
+	}
+}
+
+// TestHandleWebhook_WithdrawalFailed_RefundSucceedsThenStatusUpdated verifies
+// the happy path: refund succeeds, then the withdrawal is marked as failed.
+func TestHandleWebhook_WithdrawalFailed_RefundSucceedsThenStatusUpdated(t *testing.T) {
+	repo := newMockRepository()
+	seedPendingWithdrawal(repo, "REF-W2", decimal.NewFromInt(10))
+	transferSvc := &mockTransferService{}
+	rail := &mockRail{webhookEvt: &RailEvent{
+		Type:        EventWithdrawalFailed,
+		ProviderRef: "REF-W2",
+		Status:      "failed",
+	}}
+
+	svc := NewService(repo, rail, &mockFXService{}, transferSvc, "platform-wallet-123", "flutterwave")
+
+	if err := svc.HandleWebhook(context.Background(), []byte("{}"), "sig"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Refund transfer must have been initiated
+	if len(transferSvc.transfers) != 1 {
+		t.Fatalf("expected 1 refund transfer, got %d", len(transferSvc.transfers))
+	}
+	tr := transferSvc.transfers[0]
+	if tr.fromID != "platform-wallet-123" || tr.toID != "wallet-123" || tr.asset != "USDC" {
+		t.Errorf("unexpected refund transfer details: %+v", tr)
+	}
+
+	// Withdrawal must be marked as failed after successful refund
+	w := repo.withdrawals["withdrawal-REF-W2"]
+	if w == nil {
+		t.Fatal("withdrawal not found in repo")
+	}
+	if w.Status != domain.FiatStatusFailed {
+		t.Errorf("expected withdrawal status failed, got %s", w.Status)
+	}
+}
+
+// TestHandleWebhook_WithdrawalFailed_RetryAfterRefundFailure simulates the
+// provider retrying the webhook after a previous refund attempt failed. The
+// withdrawal is still pending, so the retry should attempt the refund again.
+func TestHandleWebhook_WithdrawalFailed_RetryAfterRefundFailure(t *testing.T) {
+	repo := newMockRepository()
+	seedPendingWithdrawal(repo, "REF-W3", decimal.NewFromInt(10))
+	transferSvc := &mockTransferService{
+		transferErr: errors.New("stellar network unavailable"),
+	}
+	rail := &mockRail{webhookEvt: &RailEvent{
+		Type:        EventWithdrawalFailed,
+		ProviderRef: "REF-W3",
+		Status:      "failed",
+	}}
+
+	svc := NewService(repo, rail, &mockFXService{}, transferSvc, "platform-wallet-123", "flutterwave")
+
+	// First delivery: refund fails, withdrawal stays pending
+	if err := svc.HandleWebhook(context.Background(), []byte("{}"), "sig"); err == nil {
+		t.Fatal("expected error on first delivery, got nil")
+	}
+
+	// Simulate provider retry: transfer service now succeeds
+	transferSvc.transferErr = nil
+
+	// Second delivery: refund should succeed and withdrawal should be marked failed
+	if err := svc.HandleWebhook(context.Background(), []byte("{}"), "sig"); err != nil {
+		t.Fatalf("unexpected error on retry: %v", err)
+	}
+
+	if len(transferSvc.transfers) != 1 {
+		t.Fatalf("expected 1 refund transfer on retry, got %d", len(transferSvc.transfers))
+	}
+
+	w := repo.withdrawals["withdrawal-REF-W3"]
+	if w == nil {
+		t.Fatal("withdrawal not found in repo")
+	}
+	if w.Status != domain.FiatStatusFailed {
+		t.Errorf("expected withdrawal status failed after retry, got %s", w.Status)
 	}
 }
 
